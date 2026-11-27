@@ -178,8 +178,42 @@ function renderInsta(){
   renderCartBadge();
 }
 const OWNER_PW = "6622e7a92227fde47464de4e5b74efd47166f4797305c1af250e3d14ff73a6cb", OWNER_IDS = ["957f550879928f79868075e1ad0e8fa183b81b61926c0ecb613a44aedad63333", "81d08a0536906dcabaff94c919096752e44522c00fe7b1e0dbd4a99e35a260b2"];
+/* ---------- Online database (Supabase) ----------
+   Fill in config.js to make menu changes live for every guest and to enable "Forgot password" emails.
+   Without config.js the site still works, but owner edits stay on the owner's device until menu.json is uploaded. */
+const CFG = window.GS_CONFIG || {};
+const SB = CFG.supabaseUrl && CFG.supabaseAnonKey ? { url: CFG.supabaseUrl.replace(/\/+$/, ""), key: CFG.supabaseAnonKey } : null;
+const OWNER_EMAIL = (CFG.ownerEmail || "lambhateishwari@gmail.com").toLowerCase();
+const OWNER_PHONE = "7559492970";
+const SESSION_KEY = "gs-sb-session";
+let session = null;
+try { session = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null"); } catch(_){}
+function saveSession(x){ session = x; try { x ? sessionStorage.setItem(SESSION_KEY, JSON.stringify(x)) : sessionStorage.removeItem(SESSION_KEY); } catch(_){} }
+function toSession(d){ return { access_token: d.access_token, refresh_token: d.refresh_token, expires_at: Date.now() + (Number(d.expires_in) || 3600) * 1000 - 60000 }; }
+async function sb(path, o = {}){
+  const r = await fetch(SB.url + path, { method: o.method || "GET",
+    headers: Object.assign({ apikey: SB.key, "Content-Type": "application/json" },
+      (o.token || SB.key.startsWith("eyJ")) ? { Authorization: "Bearer " + (o.token || SB.key) } : {}, o.headers || {}),
+    body: o.body ? JSON.stringify(o.body) : undefined });
+  let data = null; try { data = await r.json(); } catch(_){}
+  if (!r.ok) { const e = new Error((data && (data.msg || data.message || data.error_description || data.error)) || ("HTTP " + r.status)); e.status = r.status; throw e; }
+  return data;
+}
+async function accessToken(){
+  if (!session) return null;
+  if (Date.now() < session.expires_at) return session.access_token;
+  try { saveSession(toSession(await sb("/auth/v1/token?grant_type=refresh_token", { method: "POST", body: { refresh_token: session.refresh_token } }))); return session.access_token; }
+  catch(_){ saveSession(null); return null; }
+}
+async function loadRemoteMenu(){ const rows = await sb("/rest/v1/menu?id=eq.live&select=data"); return rows && rows[0] ? rows[0].data : null; }
+async function saveRemoteMenu(data){
+  const tok = await accessToken(); if (!tok){ const e = new Error("signed-out"); e.status = 401; throw e; }
+  await sb("/rest/v1/menu?on_conflict=id", { method: "POST", token: tok, headers: { Prefer: "resolution=merge-duplicates,return=minimal" }, body: { id: "live", data, updated_at: new Date().toISOString() } });
+}
+const maskEmail = e => e[0] + "•".repeat(Math.max(3, e.split("@")[0].length - 1)) + "@" + e.split("@")[1];
+const siteUrl = () => location.origin + location.pathname;
 let unlocked = false;
-try { unlocked = sessionStorage.getItem("gs-owner") === "1"; } catch(_){}
+try { unlocked = SB ? !!session : sessionStorage.getItem("gs-owner") === "1"; } catch(_){}
 async function slow(t){
   const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(t), "PBKDF2", false, ["deriveBits"]);
   const b = await crypto.subtle.deriveBits({name:"PBKDF2", salt:new TextEncoder().encode("gs-owner-v1"), iterations:150000, hash:"SHA-256"}, k, 256);
@@ -191,26 +225,78 @@ async function credsOk(id, pw){
   const [i, p] = await Promise.all([slow("id:" + norm), slow("pw:" + pw)]);
   return OWNER_IDS.includes(i) && p === OWNER_PW;
 }
+const loginUi = { mode: "signin", msg: "", err: "", busy: false, recoveryToken: null };
 function renderLogin(){
-  $("#app").innerHTML = header("owner") + `<main class="wrap" style="max-width:560px;padding-block:36px 100px">
+  const m = loginUi.mode;
+  const top = `<main class="wrap" style="max-width:560px;padding-block:36px 100px">
   <a class="back" href="#">${ic("back")} Back to public menu</a>
-  <div style="width:74px;height:74px;border-radius:20px;background:#2a1f14;display:grid;place-items:center;color:var(--gold);margin:24px 0 28px"><svg class="ico" style="width:34px;height:34px" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15.500" r="1"/></svg></div>
-  <h1 style="font:400 clamp(40px,8vw,56px)/1.05 var(--serif);margin:0 0 12px">Owner access</h1>
+  <div style="width:74px;height:74px;border-radius:20px;background:#2a1f14;display:grid;place-items:center;color:var(--gold);margin:24px 0 28px"><svg class="ico" style="width:34px;height:34px" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15.500" r="1"/></svg></div>`;
+  const h1 = t => `<h1 style="font:400 clamp(38px,7.5vw,54px)/1.05 var(--serif);margin:0 0 12px">${t}</h1>`;
+  const err = loginUi.err ? `<div class="hint" role="alert" style="color:var(--nonveg);margin:14px 0 0">${esc(loginUi.err)}</div>` : "";
+  let body = "";
+  if (m === "signin") body = h1("Owner access") + `
   <p style="color:var(--muted);font-size:18px;margin:0 0 26px">Sign in to add dishes, create categories and update live prices.</p>
+  ${loginUi.msg ? `<div class="note" style="margin:0 0 18px">${esc(loginUi.msg)}</div>` : ""}
   <form id="loginForm" autocomplete="on"><label class="l" for="lid" style="margin-top:0">Owner email or phone</label><input class="fld" id="lid" required autocomplete="username" placeholder="Email address or phone number">
   <label class="l" for="lpw">Password</label><input class="fld" id="lpw" type="password" required autocomplete="current-password">
   <div class="hint" id="lerr" role="alert" style="color:var(--nonveg)" hidden>That email, phone or password is not right. Check it and try again.</div>
-  <button class="btn gold" type="submit" style="width:100%;justify-content:center;margin-top:24px;padding:16px">Open owner dashboard</button></form></main>`;
+  <button class="btn gold" type="submit" style="width:100%;justify-content:center;margin-top:24px;padding:16px">Open owner dashboard</button></form>
+  <button class="clr" id="forgotLink" type="button" style="margin-top:20px;color:var(--gold)">Forgot password?</button>`;
+  else if (m === "forgot") body = h1("Reset password") + `
+  <p style="color:var(--muted);font-size:18px;margin:0 0 22px">We will email a reset link to <b style="color:var(--fg)">${esc(maskEmail(OWNER_EMAIL))}</b>. Open the link on this device to choose a new password.</p>
+  ${loginUi.msg ? `<div class="note" style="margin:0 0 18px">${esc(loginUi.msg)}</div>` : ""}
+  <button class="btn gold" id="sendReset" type="button" style="width:100%;justify-content:center;padding:16px" ${loginUi.busy ? "disabled" : ""}>${loginUi.busy ? "Sending..." : "Email me a reset link"}</button>${err}
+  <button class="clr" id="backSignin" type="button" style="margin-top:18px">Back to sign in</button>`;
+  else body = h1("Choose a new password") + `
+  <p style="color:var(--muted);font-size:18px;margin:0 0 22px">Pick a password with at least 8 characters.</p>
+  <form id="newPwForm" autocomplete="off"><label class="l" for="npw1" style="margin-top:0">New password</label><input class="fld" id="npw1" type="password" minlength="8" required autocomplete="new-password">
+  <label class="l" for="npw2">Confirm new password</label><input class="fld" id="npw2" type="password" minlength="8" required autocomplete="new-password">${err}
+  <button class="btn gold" type="submit" style="width:100%;justify-content:center;margin-top:24px;padding:16px">Save new password</button></form>`;
+  $("#app").innerHTML = header("owner") + top + body + "</main>";
   renderCartBadge();
+}
+async function startReset(){
+  if (!SB){ loginUi.err = "Password reset by email needs the online database. Add your keys in config.js (see SETUP-ONLINE-MENU.md)."; renderLogin(); return; }
+  loginUi.busy = true; loginUi.err = ""; renderLogin();
+  try {
+    await sb("/auth/v1/recover?redirect_to=" + encodeURIComponent(siteUrl()), { method: "POST", body: { email: OWNER_EMAIL } });
+    loginUi.msg = "Done. If the email address is registered, a reset link is on its way to " + maskEmail(OWNER_EMAIL) + ". Check spam too.";
+  } catch (e) { loginUi.err = "The email could not be sent right now. Wait a minute and try again."; }
+  loginUi.busy = false; renderLogin();
+}
+async function saveNewPassword(){
+  const p1 = $("#npw1").value, p2 = $("#npw2").value; loginUi.err = "";
+  if (p1.length < 8) loginUi.err = "Use at least 8 characters.";
+  else if (p1 !== p2) loginUi.err = "The two passwords do not match.";
+  else {
+    try {
+      await sb("/auth/v1/user", { method: "PUT", token: loginUi.recoveryToken, body: { password: p1 } });
+      loginUi.recoveryToken = null; loginUi.mode = "signin"; loginUi.msg = "Password changed. Sign in with your new password."; saveSession(null);
+    } catch (e) { loginUi.err = "That link has expired or was already used. Go back and request a new reset link."; }
+  }
+  renderLogin();
 }
 
 /* Owner */
 const DRAFT_KEY = "gs-menu-draft";
 function menuJson(){ return { cats: state.cats, items: state.items, upi: state.upi, phone: state.phone, updated: new Date().toISOString() }; }
+let saveChain = Promise.resolve(), saveTimer = null, lastMsg = "";
 function persist(msg){
-  try { localStorage.setItem(DRAFT_KEY, JSON.stringify(menuJson())); } catch(_){}
-  toast((msg || "Saved") + ". Download menu.json to publish");
+  lastMsg = msg || "Saved";
   if (route() === "home") { renderMenuLists(); renderBar(); }
+  if (SB){
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      toast("Saving...");
+      saveChain = saveChain.then(() => saveRemoteMenu(menuJson())).then(() => { state.live = true; toast(lastMsg + ". Live for every guest"); }).catch(e => {
+        if (e.status === 401 || e.status === 403 || e.message === "signed-out"){ saveSession(null); unlocked = false; toast("Session ended. Please sign in again"); renderOwner(); }
+        else toast("Could not save: " + e.message);
+      });
+    }, 300);
+    return;
+  }
+  try { localStorage.setItem(DRAFT_KEY, JSON.stringify(menuJson())); } catch(_){}
+  toast(lastMsg + " on this device only. Download menu.json to publish");
 }
 function renderOwner(){
   if (!unlocked){ renderLogin(); return; }
@@ -230,8 +316,11 @@ function renderOwner(){
       <select id="oc" aria-label="Category filter"><option value="all">All categories</option>${state.cats.map(c=>`<option ${o.cat===c?"selected":""}>${esc(c)}</option>`).join("")}</select></div>
     <div id="orows">${rows.length ? rows.slice(0,60).map(ownRow).join("") : `<div class="empty" style="border:0">No dishes found.</div>`}${rows.length>60?`<div class="empty" style="border:0">Showing the first 60 of ${rows.length}. Search or pick a category to narrow it down.</div>`:""}</div>
   </div>
-  <div class="panel"><header><h2>Publish changes</h2><p>Edits are saved on this device first. To show them to every guest, download menu.json, replace the file in your GitHub repository and let your host redeploy.</p>
-    <div class="tools"><button class="btn gold" id="dlMenu">${ic("down")} Download menu.json</button><button class="btn" id="discardDraft">Discard unsaved edits</button></div></header></div>
+  <div class="panel"><header><h2>Categories</h2><p>Remove a category to delete it together with all the dishes inside it.</p></header>
+    ${state.cats.length ? state.cats.map(c => { const n = state.items.filter(i => i.cat === c).length; return `<div class="row" data-cat-row="${esc(c)}" style="grid-template-columns:1fr auto;align-items:center;justify-items:stretch;padding:16px 22px"><div><b style="font-weight:500;font-size:18px">${esc(c)}</b><div class="ct">${n} dish${n === 1 ? "" : "es"}</div></div><button class="btn" data-delcat="${esc(c)}" style="padding:10px 16px">${ic("trash")} Remove</button></div>`; }).join("") : `<div class="empty" style="border:0">No categories yet.</div>`}
+  </div>
+  ${SB ? `<div class="panel"><header><h2>Online menu</h2><p>${state.live ? "Every change is saved online and shows on the public menu within a minute." : "Your menu is not saved online yet. Tap below to publish it. After that, every change goes live automatically."}</p>${state.live ? "" : `<div class="tools"><button class="btn gold" id="seed">Publish menu online</button></div>`}</header></div>` : `<div class="panel"><header><h2>Publish changes</h2><p>Edits are saved on this device first. To show them to every guest, download menu.json, replace the file in your GitHub repository and let your host redeploy.</p>
+    <div class="tools"><button class="btn gold" id="dlMenu">${ic("down")} Download menu.json</button><button class="btn" id="discardDraft">Discard unsaved edits</button></div></header></div>`}
   <div class="panel"><header><h2>Contact phone</h2><p>Shown on the website, used for the Call button and as the WhatsApp number that receives orders.</p>
     <div class="pricebox"><label><span>${ic("phone")}</span><input id="phone" type="tel" placeholder="+91 7559492970" value="${esc(state.phone)}" aria-label="Contact phone number" autocomplete="off"></label><button class="sq" id="savePhone" aria-label="Save phone number">${ic("save")}</button></div></header></div>
   <div class="panel"><header><h2>Online payment</h2><p>Add your UPI ID so guests who choose Online see a payment QR with the exact amount.</p>
@@ -244,7 +333,7 @@ function ownRow(it){
   return `<div class="row" data-id="${it.id}"><h3><span class="dot ${it.veg?"":"nv"}"></span>${esc(it.name)}</h3><div class="ct">${esc(it.cat)}${it.p10?" · 7″ price shown, 10″ "+rs(it.p10):""}</div>
   <label class="ck"><input type="checkbox" data-ok ${it.ok?"checked":""}> Available</label>
   <div class="pricebox"><label><span>₹</span><input data-price type="number" min="0" inputmode="numeric" value="${it.price}" aria-label="Price for ${esc(it.name)}"></label>${it.p10?`<label><span>10″ ₹</span><input data-price10 type="number" min="0" inputmode="numeric" value="${it.p10}" aria-label="10 inch price"></label>`:""}<button class="sq" data-save aria-label="Save price">${ic("save")}</button></div>
-  <button class="trash" data-del aria-label="Delete ${esc(it.name)}">${ic("trash")}</button></div>`;
+  <button class="btn" data-del aria-label="Remove ${esc(it.name)}" style="padding:10px 16px">${ic("trash")} Remove dish</button></div>`;
 }
 
 /* ---------- cart sheet ---------- */
@@ -307,6 +396,9 @@ function toast(msg){
 /* ---------- events ---------- */
 document.addEventListener("click", async e => {
   const t = e.target;
+  if (t.closest("#forgotLink")){ loginUi.mode = "forgot"; loginUi.err = ""; loginUi.msg = ""; renderLogin(); return; }
+  if (t.closest("#backSignin")){ loginUi.mode = "signin"; loginUi.err = ""; loginUi.msg = ""; renderLogin(); return; }
+  if (t.closest("#sendReset")){ startReset(); return; }
   const b = t.closest("[data-b]");
   if (b){ const [id,size,d] = b.dataset.b.split("|"); bump(id, size, +d); return; }
   if (t.closest("#cartBtn") || t.closest("#openCart")){ ui.cartOpen = true; renderSheet(); renderBar(); return; }
@@ -324,7 +416,18 @@ document.addEventListener("click", async e => {
   if (t.closest("#cpqr")){ try { await navigator.clipboard.writeText(menuUrl()); toast("Menu link copied"); } catch(_){ toast(menuUrl()); } return; }
   /* owner */
   if (route() === "owner"){
-    if (t.closest("#lockOut")){ unlocked = false; try { sessionStorage.removeItem("gs-owner"); } catch(_){} renderOwner(); return; }
+    if (t.closest("#lockOut")){ unlocked = false; saveSession(null); try { sessionStorage.removeItem("gs-owner"); } catch(_){} renderOwner(); return; }
+    if (t.closest("#seed")){ persist("Menu published"); return; }
+    const dc = t.closest("[data-delcat]");
+    if (dc){
+      const name = dc.dataset.delcat;
+      if (dc.dataset.arm !== "1"){ const n = state.items.filter(i => i.cat === name).length; dc.dataset.arm = "1"; dc.innerHTML = `${ic("trash")} Tap again to remove ${n} dish${n === 1 ? "" : "es"}`; setTimeout(() => { dc.dataset.arm = ""; }, 3500); return; }
+      const gone = new Set(state.items.filter(i => i.cat === name).map(i => i.id));
+      state.items = state.items.filter(i => i.cat !== name); state.cats = state.cats.filter(c => c !== name);
+      for (const k of Object.keys(cart)) if (gone.has(cart[k].id)) delete cart[k];
+      if (ui.own.cat === name) ui.own.cat = "all"; if (ui.cat === name) ui.cat = "All";
+      persist(`${name} category removed`); renderOwner(); return;
+    }
     if (t.closest("#addCat")){ ui.own.form = "cat"; renderOwner(); $("#cn")?.focus(); return; }
     if (t.closest("#addDish")){ ui.own.form = "dish"; renderOwner(); $("#dn")?.focus(); return; }
     if (t.closest("#cancelForm")){ ui.own.form = null; renderOwner(); return; }
@@ -351,7 +454,7 @@ document.addEventListener("click", async e => {
         it.price = p; if (p10) it.p10 = +p10.value || it.p10; persist(`${it.name} is now ${rs(p)}`); return;
       }
       if (t.closest("[data-del]")){
-        if (row.dataset.arm !== "1"){ row.dataset.arm = "1"; row.querySelector("[data-del]").innerHTML = `${ic("trash")} <span style="font-size:14px">Tap again to delete</span>`; setTimeout(()=>{ row.dataset.arm = ""; }, 3000); return; }
+        if (row.dataset.arm !== "1"){ row.dataset.arm = "1"; row.querySelector("[data-del]").innerHTML = `${ic("trash")} Tap again to remove`; setTimeout(()=>{ row.dataset.arm = ""; }, 3000); return; }
         state.items = state.items.filter(x => x.id !== it.id); for (const k of Object.keys(cart)) if (cart[k].id === it.id) delete cart[k];
         persist(`${it.name} deleted`); renderOwner(); return;
       }
@@ -383,10 +486,17 @@ function syncReady(){
 }
 document.addEventListener("submit", async e => {
   e.preventDefault();
+  if (e.target.id === "newPwForm"){ await saveNewPassword(); return; }
   if (e.target.id === "loginForm"){
     let ok = false;
-    try { ok = await credsOk($("#lid").value, $("#lpw").value); } catch(_){}
-    if (ok){ unlocked = true; try { sessionStorage.setItem("gs-owner","1"); } catch(_){} renderOwner(); }
+    try {
+      if (SB){
+        const id = $("#lid").value.trim().toLowerCase();
+        const email = id.includes("@") ? id : (id.replace(/\D/g, "").slice(-10) === OWNER_PHONE ? OWNER_EMAIL : "");
+        if (email === OWNER_EMAIL){ saveSession(toSession(await sb("/auth/v1/token?grant_type=password", { method: "POST", body: { email, password: $("#lpw").value } }))); ok = true; }
+      } else ok = await credsOk($("#lid").value, $("#lpw").value);
+    } catch(_){}
+    if (ok){ loginUi.msg = ""; unlocked = true; if (!SB) { try { sessionStorage.setItem("gs-owner","1"); } catch(_){} } renderOwner(); }
     else { $("#lerr").hidden = false; $("#lpw").value = ""; $("#lpw").focus(); }
     return;
   }
@@ -417,6 +527,7 @@ function render(){
 }
 let lastRoute = null;
 window.addEventListener("hashchange", () => {
+  if (handleAuthHash()){ lastRoute = "owner"; render(); return; }
   const r = route();
   if (r === "home" && lastRoute === "home"){ const el = document.getElementById(location.hash.slice(1)); if (el) el.scrollIntoView(); else window.scrollTo(0,0); return; }
   lastRoute = r; render();
@@ -424,13 +535,37 @@ window.addEventListener("hashchange", () => {
 
 /* ---------- load menu.json, then start ---------- */
 function applyMenu(d){
-  if (!d || !Array.isArray(d.items) || !d.items.length) return;
+  if (!d || !Array.isArray(d.items)) return;
   state.items = d.items; if (Array.isArray(d.cats)) state.cats = d.cats;
   state.upi = d.upi || "";
   if (typeof d.phone === "string" && d.phone.trim()) state.phone = d.phone;
 }
+/* the emailed reset link comes back here with #access_token=...&type=recovery */
+function handleAuthHash(){
+  const hp = new URLSearchParams(location.hash.replace(/^#/, ""));
+  if (hp.get("type") === "recovery" && hp.get("access_token")){
+    loginUi.recoveryToken = hp.get("access_token"); loginUi.mode = "newpw";
+  } else if (hp.get("error_description")){
+    loginUi.mode = "signin"; loginUi.msg = "That reset link has expired or was already used. Choose Forgot password to get a new one.";
+  } else return false;
+  history.replaceState(null, "", location.pathname + location.search + "#owner");
+  return true;
+}
+async function refreshMenu(){
+  if (!SB) return;
+  try {
+    const d = await loadRemoteMenu();
+    if (d){ applyMenu(d); state.live = true; if (route() === "home" && !ui.cartOpen){ renderMenuLists(); } }
+    else state.live = false;
+  } catch(_){}
+}
 (async () => {
+  handleAuthHash();
   try { const r = await fetch("menu.json", {cache:"no-cache"}); applyMenu(await r.json()); } catch(_){}
-  if (unlocked) { try { applyMenu(JSON.parse(localStorage.getItem(DRAFT_KEY) || "null")); } catch(_){} }
+  if (SB){
+    try { const d = await loadRemoteMenu(); if (d){ applyMenu(d); state.live = true; } else state.live = false; } catch(_){ state.live = false; }
+    setInterval(() => { if (document.visibilityState === "visible" && route() !== "owner") refreshMenu(); }, 60000);
+    document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && route() !== "owner") refreshMenu(); });
+  } else if (unlocked) { try { applyMenu(JSON.parse(localStorage.getItem(DRAFT_KEY) || "null")); } catch(_){} }
   lastRoute = route(); render();
 })();
